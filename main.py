@@ -127,18 +127,18 @@ def sync_metadata_to_chromadb(collection, metadata: Dict[str, Any]) -> int:
                     'source': source_file,
                     'display_name': doc_metadata['display_name'],
                     'author': doc_metadata['author'],
-                    'topics': doc_metadata['topics'],
+                    'topics': ', '.join(doc_metadata['topics']) if doc_metadata['topics'] else '',
                     'document_type': doc_metadata['document_type'],
-                    'year': doc_metadata['year'],
-                    'grouping': doc_metadata['grouping'],
+                    'year': str(doc_metadata['year']) if doc_metadata['year'] else '',
+                    'grouping': ', '.join(doc_metadata['grouping']) if doc_metadata['grouping'] else '',
                     'notes': doc_metadata['notes'],
                     # Preserve existing chunk-specific metadata
                     'page': chunk['metadata'].get('page'),
                     'chunk': chunk['metadata'].get('chunk')
                 }
                 
-                # Remove None values
-                updated_metadata = {k: v for k, v in updated_metadata.items() if v is not None}
+                # Remove None values and empty strings
+                updated_metadata = {k: v for k, v in updated_metadata.items() if v is not None and v != ''}
                 
                 # Update the document in ChromaDB
                 collection.update(
@@ -185,11 +185,19 @@ def get_available_groups(collection) -> Dict[str, int]:
         
         for metadata in all_docs['metadatas']:
             source = metadata.get('source', '')
-            groupings = metadata.get('grouping', [])
+            groupings_str = metadata.get('grouping', '')
             
             # Only count each source document once per group
             if source not in processed_sources:
                 processed_sources.add(source)
+                
+                # Handle both string (new format) and list (old format) groupings
+                if isinstance(groupings_str, str) and groupings_str:
+                    groupings = [g.strip() for g in groupings_str.split(',')]
+                elif isinstance(groupings_str, list):
+                    groupings = groupings_str
+                else:
+                    groupings = []
                 
                 for group in groupings:
                     if group:
@@ -203,9 +211,9 @@ def get_available_groups(collection) -> Dict[str, int]:
 def get_documents_in_group(collection, group_name: str) -> List[str]:
     """Gets all document names in a specific group."""
     try:
-        # Query for documents in this group
+        # Query for documents that contain this group in their grouping string
         results = collection.get(
-            where={"grouping": {"$in": [group_name]}},
+            where={"grouping": {"$contains": group_name}},
             include=["metadatas"]
         )
         
@@ -475,24 +483,41 @@ def get_relevant_context(collection, query: str, embedding_model, group_filters:
     # Build where clause for group filtering
     where_clause = None
     if group_filters:
-        # Filter to documents that have ANY of the specified groups
-        where_clause = {
-            "$or": [
-                {"grouping": {"$in": [group]}} for group in group_filters
-            ]
-        }
+        # Since ChromaDB doesn't support $contains, we'll filter after retrieval
+        # For now, retrieve all documents and filter in Python
         print(f"Filtering search to groups: {', '.join(group_filters)}")
+        where_clause = None  # Will filter post-retrieval
     
     try:
         # First try embedding-based search
         query_embedding = embedding_model.get_embeddings([query])[0].values
         
+        # Retrieve more results to account for filtering
+        search_n_results = n_results * 3 if group_filters else n_results
+        
         results = collection.query(
             query_embeddings=[query_embedding], 
-            n_results=n_results, 
+            n_results=search_n_results, 
             where=where_clause,
             include=["documents", "metadatas"]
         )
+        
+        # Filter results by group if needed
+        if group_filters:
+            filtered_docs = []
+            filtered_metadata = []
+            
+            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
+                grouping = metadata.get('grouping', '')
+                # Check if any of the requested groups is in this document's grouping
+                if any(group in grouping for group in group_filters):
+                    filtered_docs.append(doc)
+                    filtered_metadata.append(metadata)
+                    if len(filtered_docs) >= n_results:
+                        break
+            
+            return filtered_docs, filtered_metadata
+        
         return results['documents'][0], results['metadatas'][0]
     except Exception as e:
         print(f"Embedding search failed: {e}")
@@ -500,12 +525,32 @@ def get_relevant_context(collection, query: str, embedding_model, group_filters:
         
         # Fallback to text-based query
         try:
+            # Retrieve more results to account for filtering
+            search_n_results = n_results * 3 if group_filters else n_results
+            
             results = collection.query(
                 query_texts=[query], 
-                n_results=n_results, 
+                n_results=search_n_results, 
                 where=where_clause,
                 include=["documents", "metadatas"]
             )
+            
+            # Filter results by group if needed
+            if group_filters:
+                filtered_docs = []
+                filtered_metadata = []
+                
+                for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
+                    grouping = metadata.get('grouping', '')
+                    # Check if any of the requested groups is in this document's grouping
+                    if any(group in grouping for group in group_filters):
+                        filtered_docs.append(doc)
+                        filtered_metadata.append(metadata)
+                        if len(filtered_docs) >= n_results:
+                            break
+                
+                return filtered_docs, filtered_metadata
+            
             return results['documents'][0], results['metadatas'][0]
         except Exception as e2:
             print(f"Text search also failed: {e2}")
