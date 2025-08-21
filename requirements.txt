@@ -1,0 +1,11 @@
+pypdf
+pydub
+SpeechRecognition
+chromadb
+google-generativeai
+python-dotenv
+tqdm
+google-cloud-documentai
+google-cloud-speech
+google-cloud-storage
+google-cloud-aiplatform
