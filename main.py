@@ -2,7 +2,7 @@ import os
 import json
 import hashlib
 import textwrap
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Set
 from dotenv import load_dotenv
 
 # Google Cloud Libraries
@@ -73,6 +73,77 @@ def load_metadata() -> Dict[str, Any]:
             return json.load(f)
     return {"documents": {}, "metadata_version": "1.0", "last_updated": ""}
 
+# --- Group Management Functions ---
+
+def normalize_group_name(group_name: str) -> str:
+    """Convert group name to ChromaDB metadata field name."""
+    # Remove @ prefix if present, replace hyphens with underscores, ensure valid field name
+    clean_name = group_name.lstrip('@').replace('-', '_').replace(' ', '_').lower()
+    return f"group_{clean_name}"
+
+def create_group_metadata(groups: List[str]) -> Dict[str, bool]:
+    """Create boolean metadata fields for groups."""
+    return {normalize_group_name(group): True for group in groups if group}
+
+def get_all_possible_groups() -> Set[str]:
+    """Get all groups that could exist based on metadata.json."""
+    try:
+        with open('metadata.json', 'r') as f:
+            metadata = json.load(f)
+        
+        all_groups = set()
+        for doc_data in metadata.get('documents', {}).values():
+            groups = doc_data.get('grouping', [])
+            if isinstance(groups, list):
+                all_groups.update(groups)
+            elif isinstance(groups, str):
+                all_groups.update([g.strip() for g in groups.split(',') if g.strip()])
+        
+        return all_groups
+    except Exception as e:
+        print(f"Error reading metadata.json: {e}")
+        return set()
+
+def resync_all_group_metadata(collection):
+    """Resync all documents to update their group boolean fields based on current metadata.json."""
+    try:
+        print("Resyncing all group metadata...")
+        metadata = load_metadata()
+        
+        # Get all documents in the collection
+        all_docs = collection.get(include=["metadatas", "documents"])
+        
+        updated_count = 0
+        for doc_id, metadata_item in zip(all_docs['ids'], all_docs['metadatas']):
+            source = metadata_item.get('source', '')
+            doc_metadata = get_document_metadata(source, metadata)
+            
+            # Create new group metadata
+            group_metadata = create_group_metadata(doc_metadata['grouping'])
+            
+            # Update the existing metadata with new group fields
+            updated_metadata = metadata_item.copy()
+            
+            # Remove old group fields
+            old_group_fields = [k for k in updated_metadata.keys() if k.startswith('group_')]
+            for field in old_group_fields:
+                updated_metadata.pop(field, None)
+            
+            # Add new group fields
+            updated_metadata.update(group_metadata)
+            
+            # Update in ChromaDB
+            collection.update(
+                ids=[doc_id],
+                metadatas=[updated_metadata]
+            )
+            updated_count += 1
+        
+        print(f"Successfully resynced {updated_count} document chunks with current group metadata.")
+        
+    except Exception as e:
+        print(f"Error resyncing group metadata: {e}")
+
 def get_document_metadata(filename: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Gets metadata for a document, with fallback to auto-detection."""
     if filename in metadata.get("documents", {}):
@@ -122,6 +193,9 @@ def sync_metadata_to_chromadb(collection, metadata: Dict[str, Any]) -> int:
             
             # Update each chunk's metadata
             for chunk in chunks:
+                # Create boolean group metadata
+                group_metadata = create_group_metadata(doc_metadata['grouping'])
+                
                 # Preserve chunk-specific metadata (page, chunk number)
                 updated_metadata = {
                     'source': source_file,
@@ -130,11 +204,13 @@ def sync_metadata_to_chromadb(collection, metadata: Dict[str, Any]) -> int:
                     'topics': ', '.join(doc_metadata['topics']) if doc_metadata['topics'] else '',
                     'document_type': doc_metadata['document_type'],
                     'year': str(doc_metadata['year']) if doc_metadata['year'] else '',
-                    'grouping': ', '.join(doc_metadata['grouping']) if doc_metadata['grouping'] else '',
+                    'grouping': ', '.join(doc_metadata['grouping']) if doc_metadata['grouping'] else '',  # Keep for backward compatibility
                     'notes': doc_metadata['notes'],
                     # Preserve existing chunk-specific metadata
                     'page': chunk['metadata'].get('page'),
-                    'chunk': chunk['metadata'].get('chunk')
+                    'chunk': chunk['metadata'].get('chunk'),
+                    # Add boolean group fields
+                    **group_metadata
                 }
                 
                 # Remove None values and empty strings
@@ -183,24 +259,20 @@ def get_available_groups(collection) -> Dict[str, int]:
         group_counts = {}
         processed_sources = set()  # Track unique documents, not chunks
         
+        # Get all possible groups from metadata.json
+        all_possible_groups = get_all_possible_groups()
+        
         for metadata in all_docs['metadatas']:
             source = metadata.get('source', '')
-            groupings_str = metadata.get('grouping', '')
             
             # Only count each source document once per group
             if source not in processed_sources:
                 processed_sources.add(source)
                 
-                # Handle both string (new format) and list (old format) groupings
-                if isinstance(groupings_str, str) and groupings_str:
-                    groupings = [g.strip() for g in groupings_str.split(',')]
-                elif isinstance(groupings_str, list):
-                    groupings = groupings_str
-                else:
-                    groupings = []
-                
-                for group in groupings:
-                    if group:
+                # Check each possible group's boolean field
+                for group in all_possible_groups:
+                    group_field = normalize_group_name(group)
+                    if metadata.get(group_field, False):
                         group_counts[group] = group_counts.get(group, 0) + 1
         
         return group_counts
@@ -211,9 +283,10 @@ def get_available_groups(collection) -> Dict[str, int]:
 def get_documents_in_group(collection, group_name: str) -> List[str]:
     """Gets all document names in a specific group."""
     try:
-        # Query for documents that contain this group in their grouping string
+        # Query for documents using boolean group field
+        group_field = normalize_group_name(group_name)
         results = collection.get(
-            where={"grouping": {"$contains": group_name}},
+            where={group_field: {"$eq": True}},
             include=["metadatas"]
         )
         
@@ -387,6 +460,9 @@ def add_document_to_collection(collection, file_path: str, embedding_model, meta
             for i, chunk in enumerate(page_chunks):
                 all_chunks.append(chunk)
                 # Enhanced metadata combining JSON metadata with chunk-specific info
+                # Create boolean group metadata
+                group_metadata = create_group_metadata(doc_metadata['grouping'])
+                
                 chunk_metadata = {
                     "source": filename,
                     "display_name": doc_metadata['display_name'],
@@ -394,10 +470,12 @@ def add_document_to_collection(collection, file_path: str, embedding_model, meta
                     "topics": doc_metadata['topics'],
                     "document_type": doc_metadata['document_type'],
                     "year": doc_metadata['year'],
-                    "grouping": doc_metadata['grouping'],
+                    "grouping": doc_metadata['grouping'],  # Keep for backward compatibility
                     "notes": doc_metadata['notes'],
                     "page": page_num,
-                    "chunk": i + 1
+                    "chunk": i + 1,
+                    # Add boolean group fields
+                    **group_metadata
                 }
                 all_metadatas.append(chunk_metadata)
 
@@ -426,6 +504,9 @@ def add_document_to_collection(collection, file_path: str, embedding_model, meta
         # Enhanced metadata for non-PDF files
         all_metadatas = []
         for i in range(len(all_chunks)):
+            # Create boolean group metadata
+            group_metadata = create_group_metadata(doc_metadata['grouping'])
+            
             chunk_metadata = {
                 "source": filename,
                 "display_name": doc_metadata['display_name'],
@@ -433,9 +514,11 @@ def add_document_to_collection(collection, file_path: str, embedding_model, meta
                 "topics": doc_metadata['topics'],
                 "document_type": doc_metadata['document_type'],
                 "year": doc_metadata['year'],
-                "grouping": doc_metadata['grouping'],
+                "grouping": doc_metadata['grouping'],  # Keep for backward compatibility
                 "notes": doc_metadata['notes'],
-                "chunk": i + 1
+                "chunk": i + 1,
+                # Add boolean group fields
+                **group_metadata
             }
             all_metadatas.append(chunk_metadata)
 
@@ -483,40 +566,30 @@ def get_relevant_context(collection, query: str, embedding_model, group_filters:
     # Build where clause for group filtering
     where_clause = None
     if group_filters:
-        # Since ChromaDB doesn't support $contains, we'll filter after retrieval
-        # For now, retrieve all documents and filter in Python
+        # Create boolean group filter using $or for multiple groups
+        group_conditions = [
+            {normalize_group_name(group): {"$eq": True}} for group in group_filters
+        ]
+        
+        if len(group_conditions) == 1:
+            # Single group filter - use direct condition
+            where_clause = group_conditions[0]
+        else:
+            # Multiple group filters - use $or
+            where_clause = {"$or": group_conditions}
+        
         print(f"Filtering search to groups: {', '.join(group_filters)}")
-        where_clause = None  # Will filter post-retrieval
     
     try:
         # First try embedding-based search
         query_embedding = embedding_model.get_embeddings([query])[0].values
         
-        # Retrieve more results to account for filtering
-        search_n_results = n_results * 3 if group_filters else n_results
-        
         results = collection.query(
             query_embeddings=[query_embedding], 
-            n_results=search_n_results, 
+            n_results=n_results, 
             where=where_clause,
             include=["documents", "metadatas"]
         )
-        
-        # Filter results by group if needed
-        if group_filters:
-            filtered_docs = []
-            filtered_metadata = []
-            
-            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
-                grouping = metadata.get('grouping', '')
-                # Check if any of the requested groups is in this document's grouping
-                if any(group in grouping for group in group_filters):
-                    filtered_docs.append(doc)
-                    filtered_metadata.append(metadata)
-                    if len(filtered_docs) >= n_results:
-                        break
-            
-            return filtered_docs, filtered_metadata
         
         return results['documents'][0], results['metadatas'][0]
     except Exception as e:
@@ -525,31 +598,12 @@ def get_relevant_context(collection, query: str, embedding_model, group_filters:
         
         # Fallback to text-based query
         try:
-            # Retrieve more results to account for filtering
-            search_n_results = n_results * 3 if group_filters else n_results
-            
             results = collection.query(
                 query_texts=[query], 
-                n_results=search_n_results, 
+                n_results=n_results, 
                 where=where_clause,
                 include=["documents", "metadatas"]
             )
-            
-            # Filter results by group if needed
-            if group_filters:
-                filtered_docs = []
-                filtered_metadata = []
-                
-                for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
-                    grouping = metadata.get('grouping', '')
-                    # Check if any of the requested groups is in this document's grouping
-                    if any(group in grouping for group in group_filters):
-                        filtered_docs.append(doc)
-                        filtered_metadata.append(metadata)
-                        if len(filtered_docs) >= n_results:
-                            break
-                
-                return filtered_docs, filtered_metadata
             
             return results['documents'][0], results['metadatas'][0]
         except Exception as e2:
@@ -803,6 +857,7 @@ def main():
     print("Commands:")
     print("  list groups                    - Show all available groups")
     print("  list docs @group-name          - Show documents in a group")
+    print("  resync groups                  - Update group metadata from metadata.json")
     print("  @group-name your question      - Search within specific group(s)")
     print("  your question                  - Search all materials")
     print()
@@ -833,6 +888,11 @@ def main():
                         print(f"  - {doc}")
                 else:
                     print(f"\nNo documents found in group @{group_name}.")
+                print()
+                continue
+            
+            if query.lower() == 'resync groups':
+                resync_all_group_metadata(collection)
                 print()
                 continue
             
