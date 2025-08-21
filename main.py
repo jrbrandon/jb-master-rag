@@ -17,6 +17,8 @@ import chromadb
 from tqdm import tqdm
 import google.generativeai as genai
 import uuid
+import sys
+import argparse
 
 
 load_dotenv()
@@ -40,6 +42,7 @@ DOCAI_LOCATION = os.getenv("DOCAI_LOCATION")
 VERTEXAI_LOCATION = os.getenv("VERTEXAI_LOCATION")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 MANIFEST_FILE = "processed_files.json"
+METADATA_FILE = "metadata.json"
 
 # --- Helper Functions ---
 
@@ -62,6 +65,160 @@ def save_manifest(manifest: Dict[str, str]):
     """Saves the manifest file."""
     with open(MANIFEST_FILE, 'w') as f:
         json.dump(manifest, f, indent=4)
+
+def load_metadata() -> Dict[str, Any]:
+    """Loads the metadata file."""
+    if os.path.exists(METADATA_FILE):
+        with open(METADATA_FILE, 'r') as f:
+            return json.load(f)
+    return {"documents": {}, "metadata_version": "1.0", "last_updated": ""}
+
+def get_document_metadata(filename: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Gets metadata for a document, with fallback to auto-detection."""
+    if filename in metadata.get("documents", {}):
+        return metadata["documents"][filename]
+    
+    # Fallback: auto-detect basic metadata
+    return {
+        "display_name": filename.replace(".pdf", "").replace("_", " "),
+        "author": "Unknown",
+        "topics": [],
+        "document_type": "unknown",
+        "year": "",
+        "grouping": ["uncategorized"],
+        "notes": "Auto-generated metadata - please update in metadata.json"
+    }
+
+def sync_metadata_to_chromadb(collection, metadata: Dict[str, Any]) -> int:
+    """Syncs metadata.json changes to ChromaDB without affecting embeddings."""
+    print("Syncing metadata to ChromaDB...")
+    updated_count = 0
+    
+    try:
+        # Get all documents in the collection
+        all_docs = collection.get(include=["metadatas", "documents"])
+        
+        if not all_docs['ids']:
+            print("No documents found in ChromaDB to sync.")
+            return 0
+        
+        # Group by source document
+        doc_chunks = {}
+        for i, doc_id in enumerate(all_docs['ids']):
+            current_meta = all_docs['metadatas'][i]
+            source = current_meta.get('source', '')
+            
+            if source not in doc_chunks:
+                doc_chunks[source] = []
+            doc_chunks[source].append({
+                'id': doc_id,
+                'metadata': current_meta,
+                'document': all_docs['documents'][i]
+            })
+        
+        # Update metadata for each source document
+        for source_file, chunks in doc_chunks.items():
+            doc_metadata = get_document_metadata(source_file, metadata)
+            
+            # Update each chunk's metadata
+            for chunk in chunks:
+                # Preserve chunk-specific metadata (page, chunk number)
+                updated_metadata = {
+                    'source': source_file,
+                    'display_name': doc_metadata['display_name'],
+                    'author': doc_metadata['author'],
+                    'topics': doc_metadata['topics'],
+                    'document_type': doc_metadata['document_type'],
+                    'year': doc_metadata['year'],
+                    'grouping': doc_metadata['grouping'],
+                    'notes': doc_metadata['notes'],
+                    # Preserve existing chunk-specific metadata
+                    'page': chunk['metadata'].get('page'),
+                    'chunk': chunk['metadata'].get('chunk')
+                }
+                
+                # Remove None values
+                updated_metadata = {k: v for k, v in updated_metadata.items() if v is not None}
+                
+                # Update the document in ChromaDB
+                collection.update(
+                    ids=[chunk['id']],
+                    metadatas=[updated_metadata]
+                )
+                updated_count += 1
+        
+        print(f"Successfully updated metadata for {updated_count} document chunks.")
+        return updated_count
+        
+    except Exception as e:
+        print(f"Error syncing metadata: {e}")
+        return 0
+
+def check_metadata_sync_needed() -> bool:
+    """Checks if metadata.json is newer than last sync."""
+    if not os.path.exists(METADATA_FILE):
+        return False
+    
+    # For now, always return True - we can add timestamp tracking later
+    return True
+
+def parse_group_mentions(query: str) -> Tuple[List[str], str]:
+    """Parses @ mentions from query and returns (groups, clean_query)."""
+    import re
+    
+    # Find all @ mentions: @group-name, @another-group
+    mentions = re.findall(r'@([a-zA-Z0-9-_]+)', query)
+    
+    # Remove @ mentions from query to get clean search text
+    clean_query = re.sub(r'@[a-zA-Z0-9-_]+\s*', '', query).strip()
+    
+    return mentions, clean_query
+
+def get_available_groups(collection) -> Dict[str, int]:
+    """Gets all available groups and their document counts."""
+    try:
+        # Get all documents with their metadata
+        all_docs = collection.get(include=["metadatas"])
+        
+        group_counts = {}
+        processed_sources = set()  # Track unique documents, not chunks
+        
+        for metadata in all_docs['metadatas']:
+            source = metadata.get('source', '')
+            groupings = metadata.get('grouping', [])
+            
+            # Only count each source document once per group
+            if source not in processed_sources:
+                processed_sources.add(source)
+                
+                for group in groupings:
+                    if group:
+                        group_counts[group] = group_counts.get(group, 0) + 1
+        
+        return group_counts
+    except Exception as e:
+        print(f"Error getting available groups: {e}")
+        return {}
+
+def get_documents_in_group(collection, group_name: str) -> List[str]:
+    """Gets all document names in a specific group."""
+    try:
+        # Query for documents in this group
+        results = collection.get(
+            where={"grouping": {"$in": [group_name]}},
+            include=["metadatas"]
+        )
+        
+        # Get unique document display names
+        doc_names = set()
+        for metadata in results['metadatas']:
+            display_name = metadata.get('display_name', metadata.get('source', 'Unknown'))
+            doc_names.add(display_name)
+        
+        return sorted(list(doc_names))
+    except Exception as e:
+        print(f"Error getting documents in group {group_name}: {e}")
+        return []
 
 # --- Text Extraction Functions ---
 
@@ -196,9 +353,21 @@ def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> Li
         chunks.append(text[i:i + chunk_size])
     return chunks
 
-def add_document_to_collection(collection, file_path: str, embedding_model):
-    """Processes a single file, chunks it, and adds it to the vector store with detailed metadata."""
+def add_document_to_collection(collection, file_path: str, embedding_model, metadata: Dict[str, Any] = None):
+    """Processes a single file, chunks it, and adds it to the vector store with enhanced metadata."""
     filename = os.path.basename(file_path)
+    
+    # Get enhanced metadata from metadata.json or fallback to auto-detection
+    if metadata is None:
+        metadata = load_metadata()
+    doc_metadata = get_document_metadata(filename, metadata)
+    
+    # Log metadata source
+    if filename in metadata.get("documents", {}):
+        print(f"Using metadata.json data for: {doc_metadata['display_name']} by {doc_metadata['author']}")
+        print(f"Groups: {', '.join(doc_metadata['grouping'])}")
+    else:
+        print(f"Using auto-detected metadata for: {filename} (consider adding to metadata.json)")
     
     if file_path.endswith(".pdf"):
         pages = process_document_ai_paginated(file_path)
@@ -209,7 +378,20 @@ def add_document_to_collection(collection, file_path: str, embedding_model):
             page_chunks = chunk_text(page_text)
             for i, chunk in enumerate(page_chunks):
                 all_chunks.append(chunk)
-                all_metadatas.append({"source": filename, "page": page_num, "chunk": i + 1})
+                # Enhanced metadata combining JSON metadata with chunk-specific info
+                chunk_metadata = {
+                    "source": filename,
+                    "display_name": doc_metadata['display_name'],
+                    "author": doc_metadata['author'],
+                    "topics": doc_metadata['topics'],
+                    "document_type": doc_metadata['document_type'],
+                    "year": doc_metadata['year'],
+                    "grouping": doc_metadata['grouping'],
+                    "notes": doc_metadata['notes'],
+                    "page": page_num,
+                    "chunk": i + 1
+                }
+                all_metadatas.append(chunk_metadata)
 
     else: # Handle TXT and MP3
         document_text = ""
@@ -233,7 +415,21 @@ def add_document_to_collection(collection, file_path: str, embedding_model):
         if not document_text: return
         
         all_chunks = chunk_text(document_text)
-        all_metadatas = [{"source": filename, "chunk": i + 1} for i in range(len(all_chunks))]
+        # Enhanced metadata for non-PDF files
+        all_metadatas = []
+        for i in range(len(all_chunks)):
+            chunk_metadata = {
+                "source": filename,
+                "display_name": doc_metadata['display_name'],
+                "author": doc_metadata['author'],
+                "topics": doc_metadata['topics'],
+                "document_type": doc_metadata['document_type'],
+                "year": doc_metadata['year'],
+                "grouping": doc_metadata['grouping'],
+                "notes": doc_metadata['notes'],
+                "chunk": i + 1
+            }
+            all_metadatas.append(chunk_metadata)
 
     # Process in smaller batches to avoid token limits
     batch_size = 100  # Smaller batches for large documents
@@ -273,8 +469,20 @@ def add_document_to_collection(collection, file_path: str, embedding_model):
 
 # --- RAG and Q&A ---
 
-def get_relevant_context(collection, query: str, embedding_model, n_results: int = 7) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """Retrieves relevant context and metadata from the vector store."""
+def get_relevant_context(collection, query: str, embedding_model, group_filters: List[str] = None, n_results: int = 7) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Retrieves relevant context and metadata from the vector store with optional group filtering."""
+    
+    # Build where clause for group filtering
+    where_clause = None
+    if group_filters:
+        # Filter to documents that have ANY of the specified groups
+        where_clause = {
+            "$or": [
+                {"grouping": {"$in": [group]}} for group in group_filters
+            ]
+        }
+        print(f"Filtering search to groups: {', '.join(group_filters)}")
+    
     try:
         # First try embedding-based search
         query_embedding = embedding_model.get_embeddings([query])[0].values
@@ -282,6 +490,7 @@ def get_relevant_context(collection, query: str, embedding_model, n_results: int
         results = collection.query(
             query_embeddings=[query_embedding], 
             n_results=n_results, 
+            where=where_clause,
             include=["documents", "metadatas"]
         )
         return results['documents'][0], results['metadatas'][0]
@@ -294,6 +503,7 @@ def get_relevant_context(collection, query: str, embedding_model, n_results: int
             results = collection.query(
                 query_texts=[query], 
                 n_results=n_results, 
+                where=where_clause,
                 include=["documents", "metadatas"]
             )
             return results['documents'][0], results['metadatas'][0]
@@ -384,6 +594,11 @@ Answer (use numbered footnotes [1], [2], etc.):
 
 def main():
     """Main function to run the RAG CLI."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='JB Master RAG System')
+    parser.add_argument('--sync-metadata', action='store_true', help='Sync metadata.json to ChromaDB')
+    args = parser.parse_args()
+    
     data_directory = "data"
     
     # --- Environment Variable Check ---
@@ -486,6 +701,22 @@ def main():
     except Exception as e:
         print(f"Error initializing ChromaDB: {e}")
         return
+    
+    # Handle metadata sync command
+    if args.sync_metadata:
+        metadata = load_metadata()
+        updated_count = sync_metadata_to_chromadb(collection, metadata)
+        print(f"Metadata sync complete. Updated {updated_count} document chunks.")
+        return
+    
+    # Load metadata for normal operation
+    metadata = load_metadata()
+    
+    # Auto-sync metadata if needed
+    if check_metadata_sync_needed():
+        print("Auto-syncing metadata changes...")
+        sync_metadata_to_chromadb(collection, metadata)
+    
     manifest = load_manifest()
     
     # --- Sync Deletions ---
@@ -513,7 +744,7 @@ def main():
             collection.delete(where={"source": filename})
 
         try:
-            add_document_to_collection(collection, file_path, embedding_model)
+            add_document_to_collection(collection, file_path, embedding_model, metadata)
         except Exception as e:
             print(f"Error processing file {filename}: {e}")
             continue
@@ -524,21 +755,70 @@ def main():
 
     # --- Q&A Loop ---
     print("\n--- Q&A ---")
+    print("Commands:")
+    print("  list groups                    - Show all available groups")
+    print("  list docs @group-name          - Show documents in a group")
+    print("  @group-name your question      - Search within specific group(s)")
+    print("  your question                  - Search all materials")
+    print()
+    
     while True:
         try:
             query = input("Ask a question (or type 'quit' to exit): ")
             if query.lower() == 'quit': break
             
-            context_docs, context_metadatas = get_relevant_context(collection, query, embedding_model)
+            # Handle special commands
+            if query.lower() == 'list groups':
+                groups = get_available_groups(collection)
+                if groups:
+                    print("\nAvailable groupings:")
+                    for group, count in sorted(groups.items()):
+                        print(f"  @{group} ({count} documents)")
+                else:
+                    print("\nNo groups found.")
+                print()
+                continue
+            
+            if query.lower().startswith('list docs @'):
+                group_name = query.split('@')[1].strip()
+                docs = get_documents_in_group(collection, group_name)
+                if docs:
+                    print(f"\nDocuments in @{group_name}:")
+                    for doc in docs:
+                        print(f"  - {doc}")
+                else:
+                    print(f"\nNo documents found in group @{group_name}.")
+                print()
+                continue
+            
+            # Parse @ mentions for group filtering
+            group_filters, clean_query = parse_group_mentions(query)
+            
+            # Validate groups exist
+            if group_filters:
+                available_groups = get_available_groups(collection)
+                invalid_groups = [g for g in group_filters if g not in available_groups]
+                if invalid_groups:
+                    print(f"\nUnknown groups: {', '.join(invalid_groups)}")
+                    print("Available groups:")
+                    for group in sorted(available_groups.keys()):
+                        print(f"  @{group}")
+                    print()
+                    continue
+            
+            context_docs, context_metadatas = get_relevant_context(collection, clean_query, embedding_model, group_filters)
             
             if not context_docs:
-                print("\n--- Answer ---\nCould not find any relevant context to answer that question.")
+                if group_filters:
+                    print(f"\n--- Answer ---\nCould not find any relevant context in groups {', '.join(group_filters)} for that question.")
+                else:
+                    print("\n--- Answer ---\nCould not find any relevant context to answer that question.")
                 continue
 
-            answer = generate_response(context_docs, context_metadatas, query)
+            answer = generate_response(context_docs, context_metadatas, clean_query)
             
             print("\n--- Answer ---")
-            print(answer)  # Remove textwrap to preserve footnote formatting
+            print(answer)
             print("\n" + "="*80 + "\n")
         
         except Exception as e:

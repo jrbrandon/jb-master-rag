@@ -1,0 +1,15 @@
+{
+  "documents": {
+    "Secret Tradecraft of Elite Advisors_ Cover - David C. Baker.pdf": {
+      "display_name": "Secret Tradecraft of Elite Advisors",
+      "author": "David C. Baker",
+      "topics": ["consulting", "positioning", "pricing", "agency-management", "client-relationships"],
+      "document_type": "book",
+      "year": "2024",
+      "grouping": ["core-psdw-books", "dcb-and-be", "foundational-reading"],
+      "notes": "David Baker's comprehensive guide to elite consulting practices and positioning strategies"
+    }
+  },
+  "metadata_version": "1.0",
+  "last_updated": "2025-01-21"
+}
